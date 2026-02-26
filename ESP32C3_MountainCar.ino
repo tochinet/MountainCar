@@ -1,18 +1,23 @@
 /*************************************************************
  * Sketch for testing ESP32-C3 with LCD screen.
+ * Scope is to solve mountain car, then compare Float32 with Posit
  *
  * This sketch Copyright Tochinet 2026, MIT license
  *
- * Tried the proposed OLED_Display_SSD1306 library of WokWi
- * - won't compile, the yield added for ESP8266 is defined without #ifdef
- * - corrected by adding #ifdef and copying .h and .cpp files here
- * - incredibly slow refresh ! ABORT
+ * Started with OLED_Display_SSD1306 library of WokWi
+ * - won't compile as such, the yield added for ESP8266 is defined without #ifdef
+ * - corrected by adding #ifdef and copying .h and .cpp files in directory, sent pull request
+ * - incredibly slow refresh ! ABORT (removed the files)
  * Migrated to ABRobot ESP32-C3 w/ 0.48" I2C OLED and U8G2
  *   https://github.com/zhuhai-esp/ESP32-C3-ABrobot-OLED/ 
- * - U8G2 is supposed very fast (close to lcdgfx)
+ * - replaced OLED library with U8G2, supposed very fast (close to lcdgfx)
  * - objective is to demonstrate Mountain Car problem
  *   https://en.wikipedia.org/wiki/Mountain_car_problem
- * - manual acceleration : with E=left, R=right
+ * First release with manual (Serial) acceleration : e=left, r=right. OK
+ * Note that accelaration needed to be high to allow enough balancing
+ * Then added SARSA and Q-Learning. converged but only using RIGHT
+ * Tinkered somewhat with parameters to get most episodes OK
+ * ChatGPT recommended to add eligibily traces TODO
  *
  ************************************************************/
  
@@ -21,17 +26,19 @@
 #define SDAPIN 5
 #define SCREEN_WIDTH  72 //
 #define SCREEN_HEIGHT 40 //
-#define TESTTYPE float
+
+#define TESTTYPE float // could be posit later.
 
 #define NUM_ACTIONS 3 // -1,0,1
-#define NUM_TILES  10 // Tiles to discretize position and speed
-#define MAXEPISODES 600
+//#define NUM_TILES  10 // Tiles to discretize position and speed
+#define MAXEPISODES 5000
 #define ALPHA 0.1
 #define GAMMA 0.99
-#define EPSILON 0.1
+#define EPSILON 0.2
 
 #include <Arduino.h>
-#include <Wire.h> // FlexWire recommended by WokWi but U8g2 requires Wire
+#include <Wire.h> // Started with FlexWire as recommended by WokWi but U8g2 requires Wire
+// #include <Posit.h>
 
 //#include <lcdgfx.h> // dropped for the moment, using U8g2 instead
 #include <U8g2lib.h>
@@ -98,7 +105,7 @@ void setup() {
       digitalWrite(LEDPIN, LOW); // LED ON
     }
     trackSlope[x] = lastY - y; // negative -(y - lastY)
-    if (x % 10 ==0) Serial.println();
+    if ((x+1) % 10 ==0) Serial.println();
     u8g2.drawPixel(x, y); // in memory
     u8g2.sendBuffer();    // transfer internal memory to the display */
     lastY=y;
@@ -125,17 +132,17 @@ void loop() {
   velocity += updateVelocity(action, position);
   //velocity *= 0.98; // Attenuation, makes it more difficult 
   position += velocity;
-  if (position<0 ) { // Reached left boundary 
+  if (position<3 ) { // Reached left boundary 
     gamesLost++;
-    reward = -100;
+    //reward = -100;
     gameOver("\nGame Lost!");
   }
-  if (position>70) { // Reached right boundary 
+  if (position>60) { // Reached right boundary 
     gamesWon++;
-    reward = +100;
+    reward = 0;// reward = +100;
     gameOver("\nGame Won!");
   }
-  reward += (int)position/25; // To favorise going right...
+  //reward += (int)position/25; // To favorise going right...
   updateQ(lastPosition,lastVelocity, lastAction, reward, position, velocity, action);
 } // end of loop()
 
@@ -146,7 +153,7 @@ void drawCart(uint8_t x) {
   int8_t dy = -2 ;
 
   u8g2.drawDisc(x+dx,trackHeight[x]+dy,4);
-  u8g2.setCursor(9,12);
+  u8g2.setCursor(12,9);
   u8g2.print(velocity);
   u8g2.setCursor(42,30);
   u8g2.print(position);
@@ -154,7 +161,7 @@ void drawCart(uint8_t x) {
 }
   
 TESTTYPE updateVelocity(uint8_t action, uint8_t x) {
-  TESTTYPE delta = 0.1 * (action-1) - 0.25 * trackSlope[x]; 
+  TESTTYPE delta = 0.02 * (action-1) - 0.05 * trackSlope[x]; 
   return delta; 
 }
 
@@ -166,16 +173,22 @@ void gameOver(String Message) {
   u8g2.print(Message);
   u8g2.setCursor(0,39);
   u8g2.print(gamesLost);
-  u8g2.setCursor(60,39);
+  u8g2.setCursor(53,39);
   u8g2.print(gamesWon);
   u8g2.setDrawColor(2); // Inverting each time
   for (uint8_t i=0;i<6;i++) {
     u8g2.drawBox(0,0,SCREEN_WIDTH-1,SCREEN_HEIGHT-1);
-      u8g2.sendBuffer();
-      delay(1000);
+    u8g2.sendBuffer();
+    delay(1000);
   }
-  if (gamesWon+gamesLost < MAXEPISODES) loopsNeeded[gamesWon+gamesLost]=loopCount;
+  if (gamesWon+gamesLost < MAXEPISODES) loopsNeeded[gamesWon+gamesLost-1]=loopCount;
   loopCount=0;
+  if (gamesWon+gamesLost == MAXEPISODES-2) {
+    u8g2.drawBox(0,0,SCREEN_WIDTH-1,SCREEN_HEIGHT-1); // Invert screen
+    u8g2.sendBuffer();
+    while(!Serial.available()); // Wait for human
+  }
+
   if (gamesWon+gamesLost == MAXEPISODES) {
     Serial.print("Loop counts : ");
     long loopsAveraged =0;
@@ -185,25 +198,25 @@ void gameOver(String Message) {
       Serial.print(' ');
       if ((i+1)%10==0) {
         Serial.print("avg: ");
-        Serial.println(loopsAveraged);
+        Serial.println(loopsAveraged/10);
         loopsAveraged=0;
       }
     }
     for(;;); // STOP 
   }
-  position = minHeight;
+  position = 5+random(35);
   velocity = 0;
 }
 
 TESTTYPE getQ(TESTTYPE position, TESTTYPE velocity, uint8_t action) {
   uint8_t intPos = (uint8_t)position >>3; // 0-71 -> 0-8
-  velocity=constrain(velocity, -4.0, 4.0);
-  uint8_t intVel = (uint8_t)(velocity+4.0); // +/-4 -> 0-8
+  velocity=constrain(velocity, -2.0, 2.0);
+  uint8_t intVel = (uint8_t)(2.0*velocity+4.0); // +/-4 -> 0-8
   return Q[intPos][intVel][action];
 }
 
 uint8_t selectAction(TESTTYPE position, TESTTYPE velocity) {
-  uint8_t bestAction=1; // default still
+  uint8_t bestAction=0; // default to first action
   TESTTYPE maxQ = getQ(position, velocity, 0);
   if (Serial.available()) {
     digitalWrite(LEDPIN, LOW); // LED ON
@@ -216,7 +229,7 @@ uint8_t selectAction(TESTTYPE position, TESTTYPE velocity) {
     digitalWrite(LEDPIN, LOW); // LED ON
     return random(NUM_ACTIONS);
   }
-  for (action = 1; action< NUM_ACTIONS;action++) {
+  for (action = 1; action < NUM_ACTIONS;action++) {
     TESTTYPE currentQ = getQ(position, velocity, action);
     if (currentQ > maxQ) {
       bestAction = action;
@@ -228,8 +241,8 @@ uint8_t selectAction(TESTTYPE position, TESTTYPE velocity) {
 
 void updateQ (TESTTYPE position, TESTTYPE velocity, uint8_t action, int8_t reward, TESTTYPE nextPos, TESTTYPE nextVel, uint8_t nextAction) { 
   uint8_t intPos = (uint8_t)position >>3;
-  velocity=constrain(velocity, -4.0, 4.0);
-  uint8_t intVel = (uint8_t)(velocity+4.0); // +/-4 -> 0-8
+  velocity=constrain(velocity, -2.0, 2.0);
+  uint8_t intVel = (uint8_t)(velocity*2.0+4.0); // +/-2 -> 0-8
   TESTTYPE maxQ = max(Q[intPos][intVel][0],max(Q[intPos][intVel][1],Q[intPos][intVel][2])); // TODO improve for NUM_ACTIONS !=2
   //Q-Learning
   //Q[intPos][intVel][action] += ALPHA *(reward + GAMMA*getQ(nextPos,nextVel,nextAction) - Q[intPos][intVel][action]);
