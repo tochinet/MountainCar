@@ -24,17 +24,19 @@
 #define LEDPIN 8 // GPIO for LED, to indicate Accelerations
 #define SCLPIN 6 // Non standard I2C pins on this board
 #define SDAPIN 5
-#define SCREEN_WIDTH  72 //
-#define SCREEN_HEIGHT 40 //
+#define SCREEN_WIDTH  72 // Caution, changing here won't magically adapt x,y positions !
+#define SCREEN_HEIGHT 40 // (0,0) is top left, so y points south !
 
-#define TESTTYPE float // could be posit later.
+using real_t = float; // could be posit later. C++11 required
 
-#define NUM_ACTIONS 3 // -1,0,1
+#define NUM_ACTIONS 3 // 0,1,2 is LEFT,IDLE,RIGHT
 //#define NUM_TILES  10 // Tiles to discretize position and speed
+//real_t F[NUM_ACTIONS][NUM_TILES]; // No tiling yet
+#define NUM_BINS 16
 #define MAXEPISODES 5000
 #define ALPHA 0.1
 #define GAMMA 0.99
-#define EPSILON 0.2
+real_t epsilon = 0.2;
 
 #include <Arduino.h>
 #include <Wire.h> // Started with FlexWire as recommended by WokWi but U8g2 requires Wire
@@ -48,21 +50,25 @@ U8G2_SSD1306_72X40_ER_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE, SCLPIN, 
 
 // Arrays for height/slope of track
 uint8_t trackHeight[SCREEN_WIDTH];
-TESTTYPE trackSlope[SCREEN_WIDTH];
-TESTTYPE lastY=0; // memory to calculate slope
+real_t trackSlope[SCREEN_WIDTH];
+real_t lastY=0; // memory to calculate slope
 uint8_t lastAction, action=0; // can be [0,1,2]
-TESTTYPE lastVelocity, velocity=0; 
-TESTTYPE lastPosition, position=0; // best expressed in x or float?
+real_t lastVelocity, velocity=0; 
+real_t lastPosition, position=0; // best expressed in x or float?
 uint8_t minHeight=0; // to calculate starting position
 uint16_t gamesLost=0,gamesWon=0;
 
 // RL arrays and vars
-TESTTYPE Q[9][9][NUM_ACTIONS]; // Q table for each S,A tuple
+real_t Q[NUM_BINS][NUM_BINS][NUM_ACTIONS]; // Q table for each S,A tuple
 int8_t reward; // bounded to +/-100
-uint16_t loopCount=0,loopsNeeded[MAXEPISODES];
+int16_t loopCount=0,loopsNeeded[MAXEPISODES];
 
-// TESTTYPE F[NUM_ACTIONS][NUM_TILES]; // No tiling yet
-
+/*/ Some prototypes needed...
+real_t updateVelocity(uint8_t, uint8_t);
+uint8_t  selectAction(real_t, real_t);
+void     updateQ(real_t, real_t, uint8_t,
+                 int8_t, real_t, real_t, uint8_t); // */
+				 
 void setup() {
   Serial.begin(115200);
   Serial.println("ESP32-C3, ready to shine !");
@@ -80,6 +86,7 @@ void setup() {
   delay(2000);
   u8g2.clear();
 
+  // OLED test drawing rectangles of decreasing size
   u8g2.setDrawColor(2); // Inverting each time
   for(uint8_t x=0; x<SCREEN_HEIGHT/2; x++) {
     u8g2.drawBox(x,x,SCREEN_WIDTH-2*x,SCREEN_HEIGHT-2*x);
@@ -91,9 +98,9 @@ void setup() {
 
   // calculate approximation of sin(3x) for mountain car
   for(uint8_t x=0; x<SCREEN_WIDTH; x++) {
-    digitalWrite(LEDPIN, HIGH); // LED OFF
-    TESTTYPE y= x/40.0 - 1.0;       // first scaling screen [0,70] to approx [-.8,.6]
-    TESTTYPE halfSquare = y*y/2.0; // Intermediate value for x^3 and x^5
+    digitalWrite(LEDPIN, HIGH);  // LED OFF
+    real_t y= x/40.0 - 1.0;      // first scaling screen [0,70] to approx [-.8,.6]
+    real_t halfSquare = y*y/2.0; // Intermediate value for x^3 and x^5
     y= 3.0*y*(1.0-3.0*halfSquare/*(1.0-halfSquare)*/) ; // sin(3x) approximation (Taylor sinx = x-x^3/6+x^5/5!) 
     y= 20.0-19.0*y; // scaling sin(3x) to [39,1]
     Serial.print("(");Serial.print(x);Serial.print(",");Serial.print(y);Serial.print(") ");
@@ -112,10 +119,11 @@ void setup() {
     delay(100);  
   }
   minHeight = position ; // minheight now stores X value of lowest point for replays
+  position = 35; // To avoid first iteration to be extremely long
 }
 
 void loop() {
-  if (loopCount <65535) loopCount++; // Need to avoid overflow
+  if (loopCount <32767) loopCount++; // Need to avoid overflow
   u8g2.clear(); // clear internal memory _and_ screen
   u8g2.setDrawColor(1); // White
   lastPosition = position;
@@ -135,12 +143,12 @@ void loop() {
   if (position<3 ) { // Reached left boundary 
     gamesLost++;
     //reward = -100;
-    gameOver("\nGame Lost!");
+    gameOver(true,"\nGame Lost!");
   }
   if (position>60) { // Reached right boundary 
     gamesWon++;
     reward = 0;// reward = +100;
-    gameOver("\nGame Won!");
+    gameOver(false,"\nGame Won!");
   }
   //reward += (int)position/25; // To favorise going right...
   updateQ(lastPosition,lastVelocity, lastAction, reward, position, velocity, action);
@@ -160,12 +168,12 @@ void drawCart(uint8_t x) {
   u8g2.sendBuffer();
 }
   
-TESTTYPE updateVelocity(uint8_t action, uint8_t x) {
-  TESTTYPE delta = 0.02 * (action-1) - 0.05 * trackSlope[x]; 
+real_t updateVelocity(uint8_t action, uint8_t x) {
+  real_t delta = 0.02 * (action-1) - 0.05 * trackSlope[x]; 
   return delta; 
 }
 
-void gameOver(String Message) {
+void gameOver(bool lost, String Message) {
   Serial.print(Message);Serial.print(": ");
   Serial.print(gamesLost);Serial.print('-');
   Serial.println(gamesWon);
@@ -181,18 +189,15 @@ void gameOver(String Message) {
     u8g2.sendBuffer();
     delay(1000);
   }
-  if (gamesWon+gamesLost < MAXEPISODES) loopsNeeded[gamesWon+gamesLost-1]=loopCount;
-  loopCount=0;
-  if (gamesWon+gamesLost == MAXEPISODES-2) {
-    u8g2.drawBox(0,0,SCREEN_WIDTH-1,SCREEN_HEIGHT-1); // Invert screen
-    u8g2.sendBuffer();
-    while(!Serial.available()); // Wait for human
+  if (gamesWon+gamesLost < MAXEPISODES) {
+    loopsNeeded[gamesWon+gamesLost-1] = lost?-loopCount:loopCount;
   }
-
-  if (gamesWon+gamesLost == MAXEPISODES) {
+  loopCount=0;
+  if ((gamesWon+gamesLost)%100 == 0) {
+    epsilon *= 0.99;
     Serial.print("Loop counts : ");
     long loopsAveraged =0;
-    for (int i=0;i<MAXEPISODES;i++) { // Forget about zero on its own line
+    for (int i=0;i<gamesWon+gamesLost;i++) { // Forget about zero on its own line
       loopsAveraged += loopsNeeded[i];
       Serial.print(loopsNeeded[i]);
       Serial.print(' ');
@@ -202,22 +207,32 @@ void gameOver(String Message) {
         loopsAveraged=0;
       }
     }
-    for(;;); // STOP 
+  }
+  if (gamesWon+gamesLost == MAXEPISODES-2) {
+    u8g2.drawBox(0,0,SCREEN_WIDTH-1,SCREEN_HEIGHT-1); // Invert screen
+    u8g2.sendBuffer();
+    while(!Serial.available()); // Wait for human
+  }
+
+  if (gamesWon+gamesLost == MAXEPISODES) {
+    delay(10000);
+    gamesWon=0;
+    gamesLost=0; // Start again 
   }
   position = 5+random(35);
   velocity = 0;
 }
 
-TESTTYPE getQ(TESTTYPE position, TESTTYPE velocity, uint8_t action) {
-  uint8_t intPos = (uint8_t)position >>3; // 0-71 -> 0-8
+real_t getQ(real_t position, real_t velocity, uint8_t action) {
+  uint8_t intPos = (uint8_t)position >>2; // 0-71 -> 0-16
   velocity=constrain(velocity, -2.0, 2.0);
-  uint8_t intVel = (uint8_t)(2.0*velocity+4.0); // +/-4 -> 0-8
+  uint8_t intVel = (uint8_t)(4.0*velocity+8.0); // +/-4 -> 0-15
   return Q[intPos][intVel][action];
 }
 
-uint8_t selectAction(TESTTYPE position, TESTTYPE velocity) {
+uint8_t selectAction(real_t position, real_t velocity) {
   uint8_t bestAction=0; // default to first action
-  TESTTYPE maxQ = getQ(position, velocity, 0);
+  real_t maxQ = getQ(position, velocity, 0);
   if (Serial.available()) {
     digitalWrite(LEDPIN, LOW); // LED ON
     if (Serial.peek()=='e') {
@@ -225,12 +240,12 @@ uint8_t selectAction(TESTTYPE position, TESTTYPE velocity) {
     }
     if (Serial.read()=='r') return(2); // go right
   }
-  if (random(100)/100.0<EPSILON) { // Issue with random() with no arguments ???
+  if (random(100)/100.0 < epsilon) { // Issue with random() with no arguments ???
     digitalWrite(LEDPIN, LOW); // LED ON
     return random(NUM_ACTIONS);
   }
   for (action = 1; action < NUM_ACTIONS;action++) {
-    TESTTYPE currentQ = getQ(position, velocity, action);
+    real_t currentQ = getQ(position, velocity, action);
     if (currentQ > maxQ) {
       bestAction = action;
       maxQ=currentQ;
@@ -239,13 +254,15 @@ uint8_t selectAction(TESTTYPE position, TESTTYPE velocity) {
   return(bestAction);
 }
 
-void updateQ (TESTTYPE position, TESTTYPE velocity, uint8_t action, int8_t reward, TESTTYPE nextPos, TESTTYPE nextVel, uint8_t nextAction) { 
-  uint8_t intPos = (uint8_t)position >>3;
+void updateQ (real_t position, real_t velocity, uint8_t action, int8_t reward, real_t nextPos, real_t nextVel, uint8_t nextAction) { 
+  uint8_t intPos = (uint8_t)position >>2; // One bin for 4 pixels
+  uint8_t intNextPos = (uint8_t)nextPos >>2;
   velocity=constrain(velocity, -2.0, 2.0);
-  uint8_t intVel = (uint8_t)(velocity*2.0+4.0); // +/-2 -> 0-8
-  TESTTYPE maxQ = max(Q[intPos][intVel][0],max(Q[intPos][intVel][1],Q[intPos][intVel][2])); // TODO improve for NUM_ACTIONS !=2
+  uint8_t intVel = (uint8_t)(velocity*4.0+8.0); // +/-2 -> 0-15
+  uint8_t intNextVel = (uint8_t)(nextVel*4.0+8.0); // +/-2 -> 0-15
+  //real_t maxQ = max(Q[intPos][intVel][0],max(Q[intPos][intVel][1],Q[intPos][intVel][2])); // TODO improve for NUM_ACTIONS !=2
   //Q-Learning
-  //Q[intPos][intVel][action] += ALPHA *(reward + GAMMA*getQ(nextPos,nextVel,nextAction) - Q[intPos][intVel][action]);
+  //Q[intPos][intVel][action] += ALPHA *(reward + GAMMA*maxQ - Q[intPos][intVel][action]);
   //SARSA
   Q[intPos][intVel][action] += ALPHA *(reward + GAMMA*getQ(nextPos,nextVel,nextAction) - Q[intPos][intVel][action]);
   Serial.print(position);Serial.print(' ');
