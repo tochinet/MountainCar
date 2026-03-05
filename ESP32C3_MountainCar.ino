@@ -18,6 +18,7 @@
  * Then added SARSA and Q-Learning. converged but only using RIGHT
  * Tinkered somewhat with parameters to get most episodes OK
  * ChatGPT recommended to add eligibily traces TODO
+ * Sin x approximated by x-x^3/6 makes that left side steep
  *
  ************************************************************/
  
@@ -63,12 +64,25 @@ real_t Q[NUM_BINS][NUM_BINS][NUM_ACTIONS]; // Q table for each S,A tuple
 int8_t reward; // bounded to +/-100
 int16_t loopCount=0,loopsNeeded[MAXEPISODES];
 
-/*/ Some prototypes needed...
-real_t updateVelocity(uint8_t, uint8_t);
-uint8_t  selectAction(real_t, real_t);
-void     updateQ(real_t, real_t, uint8_t,
-                 int8_t, real_t, real_t, uint8_t); // */
-				 
+void drawCart(uint8_t x) {
+  uint8_t rear  = trackHeight[x-1] ;
+  uint8_t front = trackHeight[x+1] ;
+  int8_t dx = front - rear ; // orthogonal to track 
+  int8_t dy = -2 ;
+
+  u8g2.drawDisc(x+dx,trackHeight[x]+dy,4);
+  u8g2.setCursor(12,9);
+  u8g2.print(velocity);
+  u8g2.setCursor(42,30);
+  u8g2.print(position);
+  u8g2.sendBuffer();
+}
+
+real_t updateVelocity(uint8_t action, uint8_t x) {
+  real_t delta = 0.02 * (action-1) - 0.05 * trackSlope[x]; 
+  return delta; 
+}
+
 void setup() {
   Serial.begin(115200);
   Serial.println("ESP32-C3, ready to shine !");
@@ -99,9 +113,9 @@ void setup() {
   // calculate approximation of sin(3x) for mountain car
   for(uint8_t x=0; x<SCREEN_WIDTH; x++) {
     digitalWrite(LEDPIN, HIGH);  // LED OFF
-    real_t y= x/40.0 - 1.0;      // first scaling screen [0,70] to approx [-.8,.6]
+    real_t y= x/40.0 - 1.0;      // first scaling screen [0,70] to approx [-1,.8]
     real_t halfSquare = y*y/2.0; // Intermediate value for x^3 and x^5
-    y= 3.0*y*(1.0-3.0*halfSquare/*(1.0-halfSquare)*/) ; // sin(3x) approximation (Taylor sinx = x-x^3/6+x^5/5!) 
+    y= 3.0*y*(1.0-3.0*halfSquare*(1.0/*-halfSquare/2.0*/)) ; // sin(3x) approximation (Taylor sinx = x-x^3/6+x^5/5!) 
     y= 20.0-19.0*y; // scaling sin(3x) to [39,1]
     Serial.print("(");Serial.print(x);Serial.print(",");Serial.print(y);Serial.print(") ");
     if (y<0) y=0;
@@ -120,10 +134,10 @@ void setup() {
   }
   minHeight = position ; // minheight now stores X value of lowest point for replays
   position = 35; // To avoid first iteration to be extremely long
-}
+} // end of setup()
 
 void loop() {
-  if (loopCount <32767) loopCount++; // Need to avoid overflow
+  if (loopCount <32767) loopCount++; // Needed to avoid overflow
   u8g2.clear(); // clear internal memory _and_ screen
   u8g2.setDrawColor(1); // White
   lastPosition = position;
@@ -154,25 +168,6 @@ void loop() {
   updateQ(lastPosition,lastVelocity, lastAction, reward, position, velocity, action);
 } // end of loop()
 
-void drawCart(uint8_t x) {
-  uint8_t rear  = trackHeight[x-1] ;
-  uint8_t front = trackHeight[x+1] ;
-  int8_t dx = front - rear ; // orthogonal to track 
-  int8_t dy = -2 ;
-
-  u8g2.drawDisc(x+dx,trackHeight[x]+dy,4);
-  u8g2.setCursor(12,9);
-  u8g2.print(velocity);
-  u8g2.setCursor(42,30);
-  u8g2.print(position);
-  u8g2.sendBuffer();
-}
-  
-real_t updateVelocity(uint8_t action, uint8_t x) {
-  real_t delta = 0.02 * (action-1) - 0.05 * trackSlope[x]; 
-  return delta; 
-}
-
 void gameOver(bool lost, String Message) {
   Serial.print(Message);Serial.print(": ");
   Serial.print(gamesLost);Serial.print('-');
@@ -195,10 +190,10 @@ void gameOver(bool lost, String Message) {
   loopCount=0;
   if ((gamesWon+gamesLost)%100 == 0) {
     epsilon *= 0.99;
-    Serial.print("Loop counts : ");
+    Serial.println("\nLoop counts :");
     long loopsAveraged =0;
     for (int i=0;i<gamesWon+gamesLost;i++) { // Forget about zero on its own line
-      loopsAveraged += loopsNeeded[i];
+      loopsAveraged += abs(loopsNeeded[i]);
       Serial.print(loopsNeeded[i]);
       Serial.print(' ');
       if ((i+1)%10==0) {
@@ -224,10 +219,10 @@ void gameOver(bool lost, String Message) {
 }
 
 real_t getQ(real_t position, real_t velocity, uint8_t action) {
-  uint8_t intPos = (uint8_t)position >>2; // 0-71 -> 0-16
+  uint8_t posBin = (uint8_t)position >>2; // 0-71 -> 0-16
   velocity=constrain(velocity, -2.0, 2.0);
-  uint8_t intVel = (uint8_t)(4.0*velocity+8.0); // +/-4 -> 0-15
-  return Q[intPos][intVel][action];
+  uint8_t velBin = (uint8_t)(4.0*velocity+8.0); // +/-4 -> 0-15
+  return Q[posBin][velBin][action];
 }
 
 uint8_t selectAction(real_t position, real_t velocity) {
@@ -255,21 +250,19 @@ uint8_t selectAction(real_t position, real_t velocity) {
 }
 
 void updateQ (real_t position, real_t velocity, uint8_t action, int8_t reward, real_t nextPos, real_t nextVel, uint8_t nextAction) { 
-  uint8_t intPos = (uint8_t)position >>2; // One bin for 4 pixels
-  uint8_t intNextPos = (uint8_t)nextPos >>2;
+  uint8_t posBin = (uint8_t)position >>2; // One bin for 4 pixels
   velocity=constrain(velocity, -2.0, 2.0);
-  uint8_t intVel = (uint8_t)(velocity*4.0+8.0); // +/-2 -> 0-15
-  uint8_t intNextVel = (uint8_t)(nextVel*4.0+8.0); // +/-2 -> 0-15
-  //real_t maxQ = max(Q[intPos][intVel][0],max(Q[intPos][intVel][1],Q[intPos][intVel][2])); // TODO improve for NUM_ACTIONS !=2
+  uint8_t velBin = (uint8_t)(velocity*4.0+8.0); // +/-2 -> 0-15
   //Q-Learning
-  //Q[intPos][intVel][action] += ALPHA *(reward + GAMMA*maxQ - Q[intPos][intVel][action]);
+  //real_t maxQ = max(Q[posBin][velBin][0],max(Q[posBin][velBin][1],Q[posBin][velBin][2])); // TODO improve for NUM_ACTIONS !=2
+  //Q[posBin][velBin][action] += ALPHA *(reward + GAMMA*maxQ - Q[posBin][velBin][action]);
   //SARSA
-  Q[intPos][intVel][action] += ALPHA *(reward + GAMMA*getQ(nextPos,nextVel,nextAction) - Q[intPos][intVel][action]);
+  Q[posBin][velBin][action] += ALPHA *(reward + GAMMA*getQ(nextPos,nextVel,nextAction) - Q[posBin][velBin][action]);
   Serial.print(position);Serial.print(' ');
-  Serial.print(velocity);Serial.print(", ");
+  Serial.print(velocity);Serial.print(",  ");
+  Serial.print(posBin);Serial.print(' ');
+  Serial.print(velBin);Serial.print(' ');
   Serial.print(action);Serial.print(",  ");
-  Serial.print(Q[intPos][intVel][action]);Serial.print(",   ");
-  Serial.print(intPos);Serial.print(' ');
-  Serial.print(intVel);Serial.print(' ');
+  Serial.print(Q[posBin][velBin][action]);Serial.print(", ");
   Serial.println(reward); // */
 }
