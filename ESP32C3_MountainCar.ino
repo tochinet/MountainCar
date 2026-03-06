@@ -257,7 +257,9 @@ void updateQ (real_t position, real_t velocity, uint8_t action, int8_t reward, r
   //real_t maxQ = max(Q[posBin][velBin][0],max(Q[posBin][velBin][1],Q[posBin][velBin][2])); // TODO improve for NUM_ACTIONS !=2
   //Q[posBin][velBin][action] += ALPHA *(reward + GAMMA*maxQ - Q[posBin][velBin][action]);
   //SARSA
-  Q[posBin][velBin][action] += ALPHA *(reward + GAMMA*getQ(nextPos,nextVel,nextAction) - Q[posBin][velBin][action]);
+  if (reward==0) Q[posBin][velBin][action] += ALPHA *(reward - Q[posBin][velBin][action]);
+    else Q[posBin][velBin][action] += ALPHA *(reward + GAMMA*getQ(nextPos,nextVel,nextAction) - Q[posBin][velBin][action]);
+ 
   Serial.print(position);Serial.print(' ');
   Serial.print(velocity);Serial.print(",  ");
   Serial.print(posBin);Serial.print(' ');
