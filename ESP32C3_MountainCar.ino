@@ -21,27 +21,36 @@
  * Sin x approximated by x-x^3/6 makes that left side steep
  *
  ************************************************************/
- 
-#define LEDPIN 8 // GPIO for LED, to indicate Accelerations
+#include <Arduino.h>
+#include <Wire.h> // Started with FlexWire as recommended by WokWi but U8g2 requires Wire
+// #include <Posit.h>
+using real_t = float; // could be posit later. C++11 required
+
+// Mountain Car physics definitions
+#define NUM_ACTIONS 3 // 0,1,2 is LEFT,IDLE,RIGHT
+#define MAXEPISODES 5000
+#define MINPOS = -1.2f
+#define MAXPOS = 0.6f
+#define MINVEL = -0.07f
+#define MAXVEL = 0.07f
+#define POSGOAL = 0.5f
+
+// RL definitions
+#define ALPHA 0.1
+#define GAMMA 0.99
+real_t epsilon = 0.2;
+//#define NUM_TILES  10 // Tiles to discretize position and speed
+//real_t F[NUM_ACTIONS][NUM_TILES]; // No tiling yet
+#define NUM_POSBINS 40
+#define NUM_VELBINS 40
+
+// HW/screen definitions
+#define LEDPIN 8 // GPIO for LED, to indicate exploration etc.
 #define SCLPIN 6 // Non standard I2C pins on this board
 #define SDAPIN 5
 #define SCREEN_WIDTH  72 // Caution, changing here won't magically adapt x,y positions !
 #define SCREEN_HEIGHT 40 // (0,0) is top left, so y points south !
 
-using real_t = float; // could be posit later. C++11 required
-
-#define NUM_ACTIONS 3 // 0,1,2 is LEFT,IDLE,RIGHT
-//#define NUM_TILES  10 // Tiles to discretize position and speed
-//real_t F[NUM_ACTIONS][NUM_TILES]; // No tiling yet
-#define NUM_BINS 16
-#define MAXEPISODES 5000
-#define ALPHA 0.1
-#define GAMMA 0.99
-real_t epsilon = 0.2;
-
-#include <Arduino.h>
-#include <Wire.h> // Started with FlexWire as recommended by WokWi but U8g2 requires Wire
-// #include <Posit.h>
 
 //#include <lcdgfx.h> // dropped for the moment, using U8g2 instead
 #include <U8g2lib.h>
@@ -51,20 +60,20 @@ U8G2_SSD1306_72X40_ER_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE, SCLPIN, 
 
 // Arrays for height/slope of track
 uint8_t trackHeight[SCREEN_WIDTH];
-real_t trackSlope[SCREEN_WIDTH];
+real_t trackSlope[SCREEN_WIDTH]; // May not be useful anymore ?
 real_t lastY=0; // memory to calculate slope
-uint8_t lastAction, action=0; // can be [0,1,2]
-real_t lastVelocity, velocity=0; 
-real_t lastPosition, position=0; // best expressed in x or float?
-uint8_t minHeight=0; // to calculate starting position
-uint16_t gamesLost=0,gamesWon=0;
+uint8_t minHeight=0; // to calculate starting position  // May not be useful anymore ?
 
 // RL arrays and vars
-real_t Q[NUM_BINS][NUM_BINS][NUM_ACTIONS]; // Q table for each S,A tuple
+real_t Q[NUM_POSBINS][NUM_VELBINS][NUM_ACTIONS]; // Q table for each S,A tuple
+real_t lastPosition, position=0; 
+real_t lastVelocity, velocity=0; 
+uint8_t lastAction, action=0; // can be [0,1,2]
 int8_t reward; // bounded to +/-100
-int16_t loopCount=0,loopsNeeded[MAXEPISODES];
+int16_t loopCount=0,loopsNeeded[MAXEPISODES]; // negative sign indicates loss
+uint16_t gamesLost=0,gamesWon=0;
 
-void drawCart(uint8_t x) {
+void drawCart(uint8_t x) { //< draws the Car as a circle above the track.
   uint8_t rear  = trackHeight[x-1] ;
   uint8_t front = trackHeight[x+1] ;
   int8_t dx = front - rear ; // orthogonal to track 
@@ -85,9 +94,9 @@ real_t updateVelocity(uint8_t action, uint8_t x) {
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("ESP32-C3, ready to shine !");
-
   pinMode(LEDPIN, OUTPUT);
+  delay(2000);
+  Serial.println("ESP32-C3, ready to shine !");
 
   u8g2.begin();   // default I2C address 0x3C OK
   u8g2.enableUTF8Print(); // for accents etc.
@@ -100,7 +109,7 @@ void setup() {
   delay(2000);
   u8g2.clear();
 
-  // OLED test drawing rectangles of decreasing size
+  // OLED test : drawing rectangles of decreasing size
   u8g2.setDrawColor(2); // Inverting each time
   for(uint8_t x=0; x<SCREEN_HEIGHT/2; x++) {
     u8g2.drawBox(x,x,SCREEN_WIDTH-2*x,SCREEN_HEIGHT-2*x);
@@ -157,21 +166,22 @@ void loop() {
   if (position<3 ) { // Reached left boundary 
     gamesLost++;
     //reward = -100;
-    gameOver(true,"\nGame Lost!");
+    gameOver(true,"\nGame Lost! ");
   }
   if (position>60) { // Reached right boundary 
     gamesWon++;
     reward = 0;// reward = +100;
-    gameOver(false,"\nGame Won!");
+    gameOver(false,"\nGame Won! ");
   }
   //reward += (int)position/25; // To favorise going right...
   updateQ(lastPosition,lastVelocity, lastAction, reward, position, velocity, action);
 } // end of loop()
 
 void gameOver(bool lost, String Message) {
-  Serial.print(Message);Serial.print(": ");
-  Serial.print(gamesLost);Serial.print('-');
-  Serial.println(gamesWon);
+  Serial.print(Message);
+  Serial.print(gamesLost);Serial.print(' lost, ');
+  Serial.print(gamesWon);Serial.print(" won, ");
+  Serial.print(loopCount);Serial.println(" steps.");
   u8g2.setCursor(10,22);
   u8g2.print(Message);
   u8g2.setCursor(0,39);
@@ -189,7 +199,7 @@ void gameOver(bool lost, String Message) {
   }
   loopCount=0;
   if ((gamesWon+gamesLost)%100 == 0) {
-    epsilon *= 0.99;
+    epsilon *= 0.9; // sharper decrease to stabilize policy
     Serial.println("\nLoop counts :");
     long loopsAveraged =0;
     for (int i=0;i<gamesWon+gamesLost;i++) { // Forget about zero on its own line
@@ -219,9 +229,9 @@ void gameOver(bool lost, String Message) {
 }
 
 real_t getQ(real_t position, real_t velocity, uint8_t action) {
-  uint8_t posBin = (uint8_t)position >>2; // 0-71 -> 0-16
+  uint8_t posBin = (uint8_t)(position *NUM_POSBINS/SCREEN_WIDTH); // 0-71 -> bins
   velocity=constrain(velocity, -2.0, 2.0);
-  uint8_t velBin = (uint8_t)(4.0*velocity+8.0); // +/-4 -> 0-15
+  uint8_t velBin = (uint8_t)((velocity+2.0)*NUM_VELBINS/4); // +/-2 -> bins
   return Q[posBin][velBin][action];
 }
 
@@ -250,9 +260,9 @@ uint8_t selectAction(real_t position, real_t velocity) {
 }
 
 void updateQ (real_t position, real_t velocity, uint8_t action, int8_t reward, real_t nextPos, real_t nextVel, uint8_t nextAction) { 
-  uint8_t posBin = (uint8_t)position >>2; // One bin for 4 pixels
+  uint8_t posBin = (uint8_t)(position *NUM_POSBINS/SCREEN_WIDTH); // 0.0-71 -> posbins
   velocity=constrain(velocity, -2.0, 2.0);
-  uint8_t velBin = (uint8_t)(velocity*4.0+8.0); // +/-2 -> 0-15
+  uint8_t velBin = (uint8_t)((velocity+2.0)*NUM_VELBINS/4); // +/-2.0 -> velbins
   //Q-Learning
   //real_t maxQ = max(Q[posBin][velBin][0],max(Q[posBin][velBin][1],Q[posBin][velBin][2])); // TODO improve for NUM_ACTIONS !=2
   //Q[posBin][velBin][action] += ALPHA *(reward + GAMMA*maxQ - Q[posBin][velBin][action]);
